@@ -420,6 +420,33 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// Where a descriptor table's constant buffer view reads its title memory
+/// in place: an aligned range inside a buffer's host copy, brought up to
+/// date when the list is submitted, as an aligned root view is. A fill
+/// into upload memory reads title memory on the CPU instead, so with
+/// submissions in the air it waits for every flight whose shaders may
+/// write anywhere in that buffer. In the first room nearly all such waits
+/// (about one a frame, 20-36 ms) were for constant buffers of 48-480 bytes
+/// inside one 174 MB buffer. The aligned ones read the copy here; the
+/// others (the console needs only 16-byte alignment) still fill. `None`
+/// fills as before (`VICTORY_TABLE_CB_IN_COPY=0`: always).
+fn constant_in_copy(list: &HostList, address: u64, size: u32) -> Option<u64> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_CB_IN_COPY").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    let shadow = crate::shadow::find(address, 1)?;
+    if shadow.left(address) < u64::from(size).next_multiple_of(256) {
+        return None;
+    }
+    let gpu = shadow.gpu(address);
+    if gpu % 256 != 0 {
+        return None;
+    }
+    shadow.refresh(list, address, u64::from(size));
+    Some(gpu)
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
@@ -2203,6 +2230,10 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if let Some(gpu) = constant_in_copy(list, address, size) {
+                            host.constant_at(index, gpu, size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
